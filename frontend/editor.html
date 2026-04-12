@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>map editor</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #1e1e1e;
+        color: #ddd;
+        font-family: -apple-system, system-ui, sans-serif;
+        font-size: 14px;
+      }
+      body { display: flex; }
+      #canvas-wrap {
+        flex: 0 0 auto;
+        padding: 16px;
+      }
+      #editor {
+        cursor: crosshair;
+        display: block;
+        background: #2a2a2a;
+        border: 1px solid #444;
+      }
+      #sidebar {
+        flex: 1 1 0;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-width: 180px;
+        max-width: 240px;
+      }
+      h2 { margin: 0 0 4px; font-size: 16px; }
+      .palette-btn {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border: 2px solid transparent;
+        border-radius: 4px;
+        background: #333;
+        color: #ddd;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      .palette-btn.active { border-color: #fff; }
+      .palette-swatch {
+        width: 24px;
+        height: 24px;
+        border-radius: 3px;
+        flex-shrink: 0;
+      }
+      .actions { display: flex; flex-direction: column; gap: 6px; }
+      .actions button, .actions label {
+        padding: 8px 12px;
+        background: #444;
+        color: #ddd;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        text-align: center;
+        font-size: 13px;
+      }
+      .actions button:hover, .actions label:hover { background: #555; }
+      #status { opacity: 0.6; margin-top: auto; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="canvas-wrap">
+      <canvas id="editor" width="780" height="600"></canvas>
+    </div>
+    <div id="sidebar">
+      <h2>blocks</h2>
+      <div id="palette"></div>
+      <h2>load from server</h2>
+      <div class="actions">
+        <select id="server-maps"><option>loading...</option></select>
+        <button id="btn-server-load">open</button>
+      </div>
+      <h2>save</h2>
+      <div class="actions">
+        <input id="map-name" type="text" placeholder="map name" value="default"
+          style="padding:8px 12px;background:#333;color:#ddd;border:1px solid #555;border-radius:4px;font-size:13px;" />
+        <button id="btn-save">save to server</button>
+        <button id="btn-download">download JSON</button>
+        <label id="btn-load">load from file<input type="file" accept=".json" hidden /></label>
+        <button id="btn-clear">clear map</button>
+      </div>
+      <div id="status">right-click to erase</div>
+    </div>
+    <script src="editor.js"></script>
+  </body>
+</html>

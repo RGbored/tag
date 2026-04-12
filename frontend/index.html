@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>tag</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #1e1e1e;
+        color: #ddd;
+        font-family: -apple-system, system-ui, sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+      }
+
+      /* --- home screen --- */
+      #home-screen {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 20px;
+        width: 480px;
+      }
+      #home-screen h1 { margin: 0; font-size: 32px; letter-spacing: 2px; }
+
+      .panel {
+        background: #2a2a2a;
+        border: 1px solid #444;
+        border-radius: 8px;
+        padding: 18px 24px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .panel h2 { margin: 0 0 14px; font-size: 15px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.6; }
+
+      /* name input */
+      #name-input {
+        font-size: 15px;
+        padding: 8px 12px;
+        border-radius: 4px;
+        border: 1px solid #555;
+        background: #333;
+        color: #ddd;
+        width: 100%;
+        box-sizing: border-box;
+      }
+
+      /* create game form */
+      .form-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 10px;
+        align-items: center;
+      }
+      .form-row label { font-size: 13px; opacity: 0.7; min-width: 50px; }
+      .form-row input[type="text"], .form-row select {
+        flex: 1;
+        font-size: 14px;
+        padding: 6px 10px;
+        border-radius: 4px;
+        border: 1px solid #555;
+        background: #333;
+        color: #ddd;
+      }
+      #btn-create {
+        width: 100%;
+        font-size: 15px;
+        padding: 9px;
+        border-radius: 4px;
+        border: none;
+        background: #2ecc71;
+        color: #111;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      #btn-create:hover { background: #27ae60; }
+
+      /* room list */
+      #room-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-height: 40px;
+      }
+      .room-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #333;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font-size: 14px;
+      }
+      .room-row .room-meta { opacity: 0.6; font-size: 12px; margin-top: 2px; }
+      .room-row button {
+        font-size: 13px;
+        padding: 5px 14px;
+        border-radius: 4px;
+        border: none;
+        background: #3498db;
+        color: #fff;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .room-row button:hover { background: #2980b9; }
+      .room-row button:disabled { background: #555; color: #888; cursor: default; }
+      #no-rooms { opacity: 0.5; font-size: 13px; text-align: center; padding: 8px 0; }
+
+      /* --- canvas --- */
+      #game-wrap {
+        display: none;
+        position: relative;
+      }
+      #game {
+        background: #2a2a2a;
+        border: 1px solid #444;
+        display: block;
+      }
+      #timer-display {
+        position: absolute;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 24px;
+        font-weight: 700;
+        color: #fff;
+        text-shadow: 0 0 6px rgba(0,0,0,0.8);
+        display: none;
+      }
+
+      /* --- overlays (lobby + game over) --- */
+      .overlay {
+        position: absolute;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        background: rgba(30,30,30,0.92);
+        border-radius: 4px;
+        z-index: 10;
+      }
+      .overlay h2 { margin: 0; font-size: 22px; }
+      .overlay button {
+        font-size: 15px;
+        padding: 8px 20px;
+        border-radius: 4px;
+        border: none;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .overlay button:hover { filter: brightness(1.1); }
+      #player-list {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .player-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: #333;
+        border-radius: 6px;
+        font-size: 14px;
+      }
+      .player-chip .swatch {
+        width: 18px;
+        height: 18px;
+        border-radius: 3px;
+      }
+      #btn-start { background: #2ecc71; color: #111; }
+      #btn-play-again { background: #2ecc71; color: #111; }
+      #btn-leave { background: #555; color: #ddd; }
+      #loser-text { font-size: 20px; font-weight: 700; }
+
+      #status { font-size: 14px; opacity: 0.7; }
+      #message { font-size: 18px; }
+    </style>
+  </head>
+  <body>
+    <!-- home screen -->
+    <div id="home-screen">
+      <h1>tag</h1>
+
+      <div class="panel">
+        <h2>your name</h2>
+        <input id="name-input" type="text" placeholder="enter your name" maxlength="16" />
+      </div>
+
+      <div class="panel">
+        <h2>create game</h2>
+        <div class="form-row">
+          <label>room</label>
+          <input id="room-name-input" type="text" placeholder="room name" maxlength="32" />
+        </div>
+        <div class="form-row">
+          <label>map</label>
+          <select id="map-select"><option>loading...</option></select>
+        </div>
+        <div class="form-row">
+          <label>timer</label>
+          <select id="timer-select">
+            <option value="30">30 s</option>
+            <option value="60" selected>60 s</option>
+            <option value="90">90 s</option>
+            <option value="120">120 s</option>
+          </select>
+        </div>
+        <button id="btn-create">create &amp; join</button>
+      </div>
+
+      <div class="panel">
+        <h2>join game</h2>
+        <div id="room-list"><div id="no-rooms">no active rooms</div></div>
+      </div>
+    </div>
+
+    <!-- game area (shown after joining) -->
+    <div id="game-wrap">
+      <canvas id="game" width="780" height="600"></canvas>
+      <div id="timer-display"></div>
+
+      <!-- lobby overlay -->
+      <div id="waiting" class="overlay">
+        <h2 id="lobby-title">lobby</h2>
+        <div id="player-list"></div>
+        <p id="waiting-hint" style="opacity:0.6;font-size:13px;margin:0;">need at least 2 players to start</p>
+        <button id="btn-start">start game</button>
+        <button id="btn-leave-lobby" style="background:#555;color:#ddd;">leave</button>
+      </div>
+
+      <!-- game over overlay -->
+      <div id="game-over" class="overlay">
+        <h2>game over</h2>
+        <div id="loser-text"></div>
+        <button id="btn-play-again">play again</button>
+        <button id="btn-leave">leave room</button>
+      </div>
+    </div>
+
+    <div id="status"></div>
+    <div id="message"></div>
+    <script src="game.js"></script>
+  </body>
+</html>

@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -23,10 +28,26 @@ var upgrader = websocket.Upgrader{
 var mapNameRe = regexp.MustCompile(`^[a-zA-Z0-9_\- ]+$`)
 
 func main() {
+	addr := flag.String("addr", ":8080", "listen address")
+	logfile := flag.String("logfile", "", "path to log file (default: stderr)")
+	flag.Parse()
+
+	if *logfile != "" {
+		f, err := os.OpenFile(*logfile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("open log file: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
+
 	rm := NewRoomManager()
 
+	mux := http.NewServeMux()
+
 	// List rooms.
-	http.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -36,32 +57,52 @@ func main() {
 			_ = json.NewEncoder(w).Encode(rm.List())
 			return
 		}
-		// POST /api/rooms — create a new room.
 		handleCreateRoom(rm, w, r)
 	})
 
 	// WebSocket — join a room.
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWS(rm, w, r)
 	})
 
 	// Map list.
-	http.HandleFunc("/api/maps", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/maps", func(w http.ResponseWriter, r *http.Request) {
 		handleMapList(w, r)
 	})
 
 	// Map save/load.
-	http.HandleFunc("/api/maps/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/maps/", func(w http.ResponseWriter, r *http.Request) {
 		handleMapSave(w, r)
 	})
 
-	http.Handle("/", http.FileServer(http.Dir("../frontend")))
+	// Health check.
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
 
-	addr := ":8080"
-	log.Printf("listening on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal(err)
+	mux.Handle("/", http.FileServer(http.Dir("../frontend")))
+
+	srv := &http.Server{Addr: *addr, Handler: mux}
+
+	go func() {
+		log.Printf("listening on %s", *addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("shutdown error: %v", err)
 	}
+	log.Println("stopped")
 }
 
 func handleCreateRoom(rm *RoomManager, w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,7 @@ const (
 
 type inputMsg struct {
 	playerID int
+	seq      int
 	input    InputState
 }
 
@@ -47,6 +48,7 @@ type Hub struct {
 	timerEnd      time.Time
 	timerDuration time.Duration
 	tagContact    map[int]bool // players currently overlapping with tagger (prevents bounce)
+	lastSeq       map[int]int  // last input seq processed per player (for client-side prediction reconciliation)
 }
 
 
@@ -206,6 +208,9 @@ func (h *Hub) Run() {
 						p.WantsJump = true
 					}
 					p.Input = in.input
+					if in.seq > 0 {
+						h.lastSeq[in.playerID] = in.seq
+					}
 				}
 			}
 
@@ -220,6 +225,7 @@ func (h *Hub) Run() {
 				h.taggedID = h.randomPlayer()
 				h.loserId = -1
 				h.tagContact = make(map[int]bool)
+				h.lastSeq = make(map[int]int)
 				h.resetPlayersToSpawn()
 				h.phase = PhasePlaying
 				h.broadcastState()
@@ -313,6 +319,7 @@ func (h *Hub) broadcastState() {
 			remaining = 0
 		}
 		msg["timeLeft"] = remaining
+		msg["seqs"] = h.lastSeq
 	case PhaseGameOver:
 		msg["loserId"] = h.loserId
 	}

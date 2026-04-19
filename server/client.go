@@ -74,6 +74,7 @@ func (c *Client) readPump() {
 			Down  bool   `json:"down"`
 			Left  bool   `json:"left"`
 			Right bool   `json:"right"`
+			Seq   int    `json:"seq"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
@@ -82,6 +83,7 @@ func (c *Client) readPump() {
 		case "input":
 			c.hub.inputs <- inputMsg{
 				playerID: c.id,
+				seq:      msg.Seq,
 				input: InputState{
 					Up:    msg.Up,
 					Down:  msg.Down,

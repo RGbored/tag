@@ -42,6 +42,28 @@
   let loserId = -1;
   let ws = null;
 
+  // Snapshot interpolation — keep last two server snapshots, lerp between them each frame.
+  let prevSnapshot = null;
+  let currSnapshot = null;
+  const TICK_MS = 1000 / 30;
+
+  // Offscreen canvas baked once on map load; redrawn each frame via drawImage.
+  let tileCache = null;
+
+  // Physics constants — must match server/game.go exactly.
+  const PLAYER_SPEED = 7;
+  const GRAVITY = 0.7;
+  const JUMP_VEL = 12.0;
+  const MAX_FALL = 16.0;
+  const WORLD_W = 780;
+  const WORLD_H = 600;
+
+  // Client-side prediction state.
+  let pred = null;       // { x, y, velY, onGround, wantsJump } — local player only
+  let predPrev = null;   // pred at start of current tick, for intra-tick lerp
+  let solidGrid = null;  // boolean[row][col] built from tile map
+  let lastPredTick = 0;  // rAF timestamp of last physics step
+
   const keys = { up: false, down: false, left: false, right: false };
   const keyMap = {
     ArrowUp: "up", w: "up", W: "up",
@@ -214,19 +236,60 @@
           myId = msg.id;
           playerSize = msg.playerSize;
           tileSize = msg.tileSize || 30;
-          if (msg.map) tileMap = msg.map;
           if (msg.blockTypes) blockTypes = msg.blockTypes;
+          if (msg.map) { tileMap = msg.map; buildTileCache(); buildSolidGrid(); }
           if (msg.roomName) lobbyTitleEl.textContent = msg.roomName;
           break;
 
-        case "state":
-          players = msg.players || [];
-          phase = msg.phase || "lobby";
+        case "state": {
+          const newPhase = msg.phase || "lobby";
+          const newPlayers = msg.players || [];
+          prevSnapshot = currSnapshot;
+          currSnapshot = { players: newPlayers, time: performance.now() };
+          players = newPlayers;
+
+          // Initialise prediction when entering playing phase.
+          if (newPhase === "playing" && phase !== "playing") {
+            const me = newPlayers.find(p => p.id === myId);
+            if (me) {
+              pred = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: false };
+              predPrev = { ...pred };
+              lastPredTick = performance.now();
+            }
+          }
+          // Clear prediction when leaving playing phase.
+          if (newPhase !== "playing") { pred = null; predPrev = null; }
+
+          // Soft correction: gently blend pred toward server's authoritative position.
+          // For local play the delta is <1px; for network play it smooths out without snapping.
+          if (newPhase === "playing" && pred !== null) {
+            const me = newPlayers.find(p => p.id === myId);
+            if (me) {
+              const dx = me.x - pred.x;
+              const dy = me.y - pred.y;
+              if (Math.hypot(dx, dy) > 120) {
+                // Large gap (e.g. spawn): snap immediately.
+                pred.x = me.x; pred.y = me.y;
+                pred.velY = me.velY ?? 0;
+                pred.onGround = me.onGround ?? false;
+                predPrev = { ...pred };
+              } else {
+                // Small drift: nudge 25% toward server each tick.
+                pred.x += dx * 0.25;
+                pred.y += dy * 0.25;
+                pred.velY = me.velY ?? pred.velY;
+                pred.onGround = me.onGround ?? pred.onGround;
+              }
+            }
+          }
+
+          phase = newPhase;
           taggedId = msg.taggedId ?? -1;
           timeLeft = msg.timeLeft ?? 0;
           loserId = msg.loserId ?? -1;
           updateUI();
           break;
+        }
 
         case "full":
           messageEl.textContent = "room is full";
@@ -314,6 +377,8 @@
     e.preventDefault();
     if (!keys[k]) {
       keys[k] = true;
+      // Set wantsJump directly on rising edge of Up — consumed by stepPred when on ground.
+      if (k === "up" && pred !== null) pred.wantsJump = true;
       sendInput();
     }
   });
@@ -342,16 +407,96 @@
     return "#2a2a2a";
   }
 
-  function drawTiles() {
-    if (!tileMap) return;
+  function buildSolidGrid() {
+    solidGrid = [];
+    for (let r = 0; r < tileMap.rows; r++) {
+      solidGrid[r] = [];
+      for (let c = 0; c < tileMap.cols; c++) {
+        const id = tileMap.tiles[r][c];
+        solidGrid[r][c] = id >= 0 && id < blockTypes.length && blockTypes[id].solid;
+      }
+    }
+  }
+
+  function isSolidPred(px, py) {
+    if (!solidGrid) return false;
+    const colMin = Math.floor(px / tileSize);
+    const colMax = Math.floor((px + playerSize - 1) / tileSize);
+    const rowMin = Math.floor(py / tileSize);
+    const rowMax = Math.floor((py + playerSize - 1) / tileSize);
+    for (let r = rowMin; r <= rowMax; r++) {
+      for (let c = colMin; c <= colMax; c++) {
+        if (r >= 0 && r < solidGrid.length && c >= 0 && c < solidGrid[r].length && solidGrid[r][c]) return true;
+      }
+    }
+    return false;
+  }
+
+  function clampPred(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  // Advance prediction state by one tick — mirrors server Player.Step() exactly.
+  function stepPred(s, inp) {
+    let { x, y, velY, onGround, wantsJump } = s;
+
+    // Horizontal
+    let dx = 0;
+    if (inp.left) dx -= PLAYER_SPEED;
+    if (inp.right) dx += PLAYER_SPEED;
+    x += dx;
+    x = clampPred(x, 0, WORLD_W - playerSize);
+    if (isSolidPred(x, y)) { x -= dx; x = clampPred(x, 0, WORLD_W - playerSize); }
+
+    // Jump: only fires if on ground this tick; no buffering.
+    if (wantsJump && onGround) { velY = -JUMP_VEL; onGround = false; }
+    wantsJump = false;
+
+    // Gravity
+    velY = Math.min(velY + GRAVITY, MAX_FALL);
+    y += velY;
+    y = clampPred(y, 0, WORLD_H - playerSize);
+
+    if (isSolidPred(x, y)) {
+      if (velY > 0) {
+        y = Math.floor((y + playerSize) / tileSize) * tileSize - playerSize;
+      } else {
+        y = Math.ceil(y / tileSize) * tileSize;
+      }
+      velY = 0;
+    }
+    // Ground probe: check 2px below so onGround stays true across the small gravity oscillation.
+    onGround = isSolidPred(x, y + 2);
+
+    return { x, y, velY, onGround, wantsJump };
+  }
+
+  function buildTileCache() {
+    const oc = new OffscreenCanvas(canvas.width, canvas.height);
+    const octx = oc.getContext('2d');
+    octx.fillStyle = blockColor(0);
+    octx.fillRect(0, 0, canvas.width, canvas.height);
     for (let r = 0; r < tileMap.rows; r++) {
       for (let c = 0; c < tileMap.cols; c++) {
         const id = tileMap.tiles[r][c];
         if (id === 0) continue;
-        ctx.fillStyle = blockColor(id);
-        ctx.fillRect(c * tileSize, r * tileSize, tileSize, tileSize);
+        octx.fillStyle = blockColor(id);
+        octx.fillRect(c * tileSize, r * tileSize, tileSize, tileSize);
       }
     }
+    tileCache = oc;
+  }
+
+  function drawTiles() {
+    if (tileCache) ctx.drawImage(tileCache, 0, 0);
+  }
+
+  function getInterpolatedPlayers() {
+    if (!prevSnapshot || !currSnapshot) return players;
+    const t = Math.min((performance.now() - currSnapshot.time) / TICK_MS, 1);
+    return currSnapshot.players.map(curr => {
+      const prev = prevSnapshot.players.find(p => p.id === curr.id);
+      if (!prev) return curr;
+      return { ...curr, x: prev.x + (curr.x - prev.x) * t, y: prev.y + (curr.y - prev.y) * t };
+    });
   }
 
   function drawArrow(px, py) {
@@ -366,19 +511,41 @@
     ctx.fill();
   }
 
-  function draw() {
+  function draw(ts) {
+    // Advance local prediction at 30 Hz — one step per tick, same rate as server.
+    if (pred !== null && phase === "playing" && ts - lastPredTick >= TICK_MS) {
+      predPrev = { ...pred };
+      pred = stepPred(pred, keys);
+      lastPredTick += TICK_MS;
+    }
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     drawTiles();
-    for (const p of players) {
+
+    // Intra-tick lerp factor for local player — mirrors getInterpolatedPlayers() for smoothness.
+    const predT = (pred !== null && predPrev !== null)
+      ? Math.min((ts - lastPredTick) / TICK_MS, 1)
+      : 1;
+
+    for (const p of getInterpolatedPlayers()) {
+      const isMe = p.id === myId;
+      let rx, ry;
+      if (isMe && pred !== null && predPrev !== null) {
+        rx = predPrev.x + (pred.x - predPrev.x) * predT;
+        ry = predPrev.y + (pred.y - predPrev.y) * predT;
+      } else {
+        rx = p.x;
+        ry = p.y;
+      }
       ctx.fillStyle = p.color;
-      ctx.fillRect(p.x, p.y, playerSize, playerSize);
-      if (p.id === myId) {
+      ctx.fillRect(rx, ry, playerSize, playerSize);
+      if (isMe) {
         ctx.lineWidth = 2;
         ctx.strokeStyle = "#ffffff";
-        ctx.strokeRect(p.x + 0.5, p.y + 0.5, playerSize - 1, playerSize - 1);
+        ctx.strokeRect(rx + 0.5, ry + 0.5, playerSize - 1, playerSize - 1);
       }
       if (p.id === taggedId && phase === "playing") {
-        drawArrow(p.x, p.y);
+        drawArrow(rx, ry);
       }
     }
     requestAnimationFrame(draw);

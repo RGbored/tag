@@ -115,9 +115,9 @@ type Player struct {
 	Y          float64 `json:"y"`
 	Color      string  `json:"color"`
 	Name       string  `json:"name"`
-	VelY       float64 `json:"-"`
-	OnGround   bool    `json:"-"`
-	WantsJump  bool    `json:"-"` // set on Up press, consumed when landing; allows buffered jumps
+	VelY       float64 `json:"velY"`
+	OnGround   bool    `json:"onGround"`
+	WantsJump  bool    `json:"-"` // set on rising edge of Up, cleared each tick
 	Input      InputState
 }
 
@@ -140,12 +140,12 @@ func (p *Player) Step(m *GameMap) {
 		p.clamp()
 	}
 
-	// --- Jump (buffered: WantsJump set on rising edge of Up, consumed on landing) ---
+	// --- Jump: only fires if on ground this tick; no buffering ---
 	if p.WantsJump && p.OnGround {
 		p.VelY = -JumpVelocity
 		p.OnGround = false
-		p.WantsJump = false
 	}
+	p.WantsJump = false
 
 	// --- Gravity ---
 	p.VelY += Gravity
@@ -160,15 +160,14 @@ func (p *Player) Step(m *GameMap) {
 		if p.VelY > 0 {
 			// Falling — snap bottom of player to top of the solid tile row.
 			p.Y = math.Floor((p.Y+PlayerSize)/TileSize)*TileSize - PlayerSize
-			p.OnGround = true
 		} else {
 			// Rising — snap top of player to bottom of the ceiling tile row.
 			p.Y = math.Ceil(p.Y/TileSize) * TileSize
 		}
 		p.VelY = 0
-	} else {
-		p.OnGround = false
 	}
+	// Ground probe: check 2px below so onGround stays true across the small gravity oscillation.
+	p.OnGround = m != nil && m.IsSolid(p.X, p.Y+2)
 }
 
 // PlayersOverlap reports whether two player rectangles overlap (AABB).

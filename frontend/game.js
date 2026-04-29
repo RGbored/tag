@@ -63,7 +63,6 @@
   let predPrev = null;   // pred at start of current tick, for intra-tick lerp
   let solidGrid = null;  // boolean[row][col] built from tile map
   let lastPredTick = 0;  // rAF timestamp of last physics step
-  let inputSeq = 0;      // monotonic counter sent with every input message
 
   const keys = { up: false, down: false, left: false, right: false };
   const keyMap = {
@@ -275,16 +274,11 @@
                 pred.onGround = me.onGround ?? false;
                 predPrev = { ...pred };
               } else {
-                // Small drift: nudge 25% toward server position, but only if the
-                // resulting position isn't inside a wall (prevents correction-induced sticking).
-                const nx = pred.x + dx * 0.25;
-                const ny = pred.y + dy * 0.25;
-                if (!isSolidPred(nx, ny)) {
-                  pred.x = nx;
-                  pred.y = ny;
-                }
-                // Don't overwrite velY/onGround — keeping physics state consistent
-                // with the nudged position avoids micro-bounces and impossible states.
+                // Small drift: nudge 25% toward server each tick.
+                pred.x += dx * 0.25;
+                pred.y += dy * 0.25;
+                pred.velY = me.velY ?? pred.velY;
+                pred.onGround = me.onGround ?? pred.onGround;
               }
             }
           }
@@ -373,7 +367,7 @@
   // --- Input ---
   function sendInput() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", seq: ++inputSeq, ...keys }));
+    ws.send(JSON.stringify({ type: "input", ...keys }));
   }
 
   window.addEventListener("keydown", (e) => {
@@ -518,17 +512,11 @@
   }
 
   function draw(ts) {
-    // Advance local prediction at 30 Hz. If we've fallen behind (slow device,
-    // backgrounded tab), reset the clock rather than bursting many catch-up steps.
-    if (pred !== null && phase === "playing") {
-      if (ts - lastPredTick > TICK_MS * 8) lastPredTick = ts - TICK_MS;
-      let steps = 0;
-      while (ts - lastPredTick >= TICK_MS && steps < 3) {
-        predPrev = { ...pred };
-        pred = stepPred(pred, keys);
-        lastPredTick += TICK_MS;
-        steps++;
-      }
+    // Advance local prediction at 30 Hz — one step per tick, same rate as server.
+    if (pred !== null && phase === "playing" && ts - lastPredTick >= TICK_MS) {
+      predPrev = { ...pred };
+      pred = stepPred(pred, keys);
+      lastPredTick += TICK_MS;
     }
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);

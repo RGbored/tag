@@ -59,10 +59,12 @@
   const WORLD_H = 600;
 
   // Client-side prediction state.
-  let pred = null;       // { x, y, velY, onGround, wantsJump } — local player only
-  let predPrev = null;   // pred at start of current tick, for intra-tick lerp
-  let solidGrid = null;  // boolean[row][col] built from tile map
-  let lastPredTick = 0;  // rAF timestamp of last physics step
+  let pred = null;        // { x, y, velY, onGround, wantsJump } — local player only
+  let predPrev = null;    // pred at start of current tick, for intra-tick lerp
+  let solidGrid = null;   // boolean[row][col] built from tile map
+  let lastPredTick = 0;   // rAF timestamp of last physics step
+  let inputSeq = 0;       // monotonic counter; incremented on every input message sent
+  let predHistory = [];   // { seq, keys:{up,down,left,right}, wantsJump } — one entry per tick
 
   const keys = { up: false, down: false, left: false, right: false };
   const keyMap = {
@@ -255,31 +257,40 @@
               pred = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: false };
               predPrev = { ...pred };
               lastPredTick = performance.now();
+              predHistory = [];
             }
           }
           // Clear prediction when leaving playing phase.
-          if (newPhase !== "playing") { pred = null; predPrev = null; }
+          if (newPhase !== "playing") { pred = null; predPrev = null; predHistory = []; }
 
-          // Soft correction: gently blend pred toward server's authoritative position.
-          // For local play the delta is <1px; for network play it smooths out without snapping.
+          // Rollback reconciliation: when the server acknowledges an input seq, start from
+          // the server's authoritative state and re-simulate all inputs the server hasn't
+          // seen yet. This eliminates rubberbanding caused by stale positional corrections.
           if (newPhase === "playing" && pred !== null) {
             const me = newPlayers.find(p => p.id === myId);
             if (me) {
-              const dx = me.x - pred.x;
-              const dy = me.y - pred.y;
-              if (Math.hypot(dx, dy) > 120) {
-                // Large gap (e.g. spawn): snap immediately.
-                pred.x = me.x; pred.y = me.y;
-                pred.velY = me.velY ?? 0;
-                pred.onGround = me.onGround ?? false;
-                predPrev = { ...pred };
-              } else {
-                // Small drift: nudge 25% toward server each tick.
-                pred.x += dx * 0.25;
-                pred.y += dy * 0.25;
-                pred.velY = me.velY ?? pred.velY;
-                pred.onGround = me.onGround ?? pred.onGround;
+              const ackSeq = (msg.seqs && msg.seqs[myId]) || 0;
+              if (ackSeq > 0) {
+                // Find the first history entry that the server hasn't processed yet.
+                const replayStart = predHistory.findIndex(e => e.seq > ackSeq);
+                if (replayStart === -1) {
+                  // Server is fully caught up — its state is ground truth.
+                  pred = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: false };
+                  predHistory = [];
+                } else {
+                  // Re-simulate unacknowledged inputs on top of the confirmed server state.
+                  let s = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: false };
+                  for (let i = replayStart; i < predHistory.length; i++) {
+                    s.wantsJump = predHistory[i].wantsJump;
+                    s = stepPred(s, predHistory[i].keys);
+                  }
+                  pred = s;
+                  predPrev = { ...pred };
+                  predHistory = predHistory.slice(replayStart);
+                }
               }
+              // If ackSeq === 0 the server hasn't received our first input yet —
+              // pred was seeded from server state on phase entry, so no correction needed.
             }
           }
 
@@ -367,7 +378,7 @@
   // --- Input ---
   function sendInput() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", ...keys }));
+    ws.send(JSON.stringify({ type: "input", seq: ++inputSeq, ...keys }));
   }
 
   window.addEventListener("keydown", (e) => {
@@ -377,7 +388,7 @@
     e.preventDefault();
     if (!keys[k]) {
       keys[k] = true;
-      // Set wantsJump directly on rising edge of Up — consumed by stepPred when on ground.
+      // Set wantsJump on rising edge of Up — recorded into history and consumed by stepPred.
       if (k === "up" && pred !== null) pred.wantsJump = true;
       sendInput();
     }
@@ -514,6 +525,9 @@
   function draw(ts) {
     // Advance local prediction at 30 Hz — one step per tick, same rate as server.
     if (pred !== null && phase === "playing" && ts - lastPredTick >= TICK_MS) {
+      // Record this tick in history (pre-step state) for rollback reconciliation.
+      predHistory.push({ seq: inputSeq, keys: { ...keys }, wantsJump: pred.wantsJump });
+      if (predHistory.length > 120) predHistory.shift(); // keep ~4s
       predPrev = { ...pred };
       pred = stepPred(pred, keys);
       lastPredTick += TICK_MS;

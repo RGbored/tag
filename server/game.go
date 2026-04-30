@@ -117,8 +117,8 @@ type Player struct {
 	Name       string  `json:"name"`
 	VelY       float64 `json:"velY"`
 	OnGround   bool    `json:"onGround"`
-	WantsJump  bool    `json:"-"` // set on rising edge of Up, cleared each tick
-	Input      InputState
+	WantsJump  bool       `json:"-"` // set on rising edge of Up, cleared each tick
+	Input      InputState `json:"-"` // not sent to clients
 }
 
 // Step advances the player one tick with gravity-based platformer physics.

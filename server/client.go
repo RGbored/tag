@@ -13,7 +13,7 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 1024
-	sendBufferSize = 16
+	sendBufferSize = 64
 )
 
 // Client is a single WebSocket connection.

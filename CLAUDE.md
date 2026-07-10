@@ -42,18 +42,26 @@ Single Go process, no framework. `main.go` registers HTTP routes and hands off t
 
 **Tag mechanic:** `tagContact map[int]bool` tracks which players are currently overlapping with the tagger. Tag transfers only on the **first frame** of contact, preventing bounce-back while players remain touching.
 
-**Client (`client.go`):** Two goroutines per connection — `readPump` (parses messages, forwards to hub channels) and `writePump` (drains send channel, sends pings). Send buffer is 16 messages; full buffers are dropped silently.
+**Client (`client.go`):** Two goroutines per connection — `readPump` (parses messages, forwards to hub channels) and `writePump` (drains send channel, sends pings). Send buffer is 64 messages; full buffers are dropped silently.
+
+### Netcode
+
+The client (`game.js`) runs its own 30 Hz prediction of the local player (`stepPred` mirrors `Player.Step` exactly) and sends one input message **per predicted tick** with a monotonic `seq`. The server acks the last seq applied per player (`seqs` in the state message); on each snapshot the client re-simulates unacked ticks on top of the server state (rollback reconciliation). Corrections are folded into a visual offset (`corrX/corrY`) that decays over ~150ms instead of snapping. Seq must map 1:1 to ticks — sending inputs only on key events breaks reconciliation and causes rubberbanding at real-network RTT (invisible on localhost).
+
+Remote players render through a snapshot jitter buffer: state messages carry a server `tick`, and the client renders other players ~3 ticks (100ms) in the past, interpolating between buffered snapshots. Measured RTT (client timestamp `t` echoed back via `pings`) is drawn in the canvas corner during play.
+
+To test netcode changes under latency, run a delay proxy in front of the server and drive two browsers — DevTools throttling does not affect WebSockets, and headless Chrome runs rAF below 30fps which masks prediction bugs (use headful).
 
 ### Message protocol
 
 Client → server:
-- `{type:"input", up, down, left, right}` — sent on keydown/keyup
+- `{type:"input", seq, jump, t, up, down, left, right}` — sent every client tick while playing; `seq` is a per-tick counter, `jump` requests a jump (edge-detected keydowns can fall between ticks), `t` is a client timestamp echoed back for RTT
 - `{type:"start"}` — start the round (lobby only, requires ≥2 players)
 - `{type:"restart"}` — return to lobby (gameover only)
 
 Server → client:
 - `{type:"welcome", id, roomName, timerSecs, playerSize, tileSize, map, blockTypes}` — sent on join
-- `{type:"state", phase, players, taggedId?, timeLeft?, loserId?}` — broadcast every tick
+- `{type:"state", phase, tick, players, taggedId?, timeLeft?, seqs?, pings?, loserId?}` — broadcast every tick; `seqs` = last input seq applied per player, `pings` = last input timestamp per player (echo)
 - `{type:"in_progress"}` or `{type:"full"}` — rejection messages
 
 ### Map format

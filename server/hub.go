@@ -18,6 +18,8 @@ const (
 type inputMsg struct {
 	playerID int
 	seq      int
+	jump     bool    // explicit jump request (keydown may fall between per-tick sends)
+	sentAt   float64 // client timestamp, echoed back for RTT measurement
 	input    InputState
 }
 
@@ -49,6 +51,8 @@ type Hub struct {
 	timerDuration time.Duration
 	tagContact    map[int]bool // players currently overlapping with tagger (prevents bounce)
 	lastSeq       map[int]int  // last input seq processed per player (for client-side prediction reconciliation)
+	lastPing      map[int]float64 // latest client timestamp per player, echoed back for RTT display
+	tick          int64        // increments every ticker fire; lets clients order snapshots for interpolation
 }
 
 
@@ -207,9 +211,15 @@ func (h *Hub) Run() {
 					if in.input.Up && !p.Input.Up {
 						p.WantsJump = true
 					}
+					if in.jump {
+						p.WantsJump = true
+					}
 					p.Input = in.input
 					if in.seq > 0 {
 						h.lastSeq[in.playerID] = in.seq
+					}
+					if in.sentAt > 0 {
+						h.lastPing[in.playerID] = in.sentAt
 					}
 				}
 			}
@@ -226,6 +236,7 @@ func (h *Hub) Run() {
 				h.loserId = -1
 				h.tagContact = make(map[int]bool)
 				h.lastSeq = make(map[int]int)
+				h.lastPing = make(map[int]float64)
 				h.resetPlayersToSpawn()
 				h.phase = PhasePlaying
 				h.broadcastState()
@@ -244,6 +255,7 @@ func (h *Hub) Run() {
 			}
 
 		case <-ticker.C:
+			h.tick++
 			if h.phase == PhasePlaying {
 				// Physics.
 				for _, p := range h.players {
@@ -308,6 +320,7 @@ func (h *Hub) broadcastState() {
 	msg := map[string]any{
 		"type":    "state",
 		"phase":   h.phase,
+		"tick":    h.tick,
 		"players": players,
 	}
 
@@ -320,6 +333,7 @@ func (h *Hub) broadcastState() {
 		}
 		msg["timeLeft"] = remaining
 		msg["seqs"] = h.lastSeq
+		msg["pings"] = h.lastPing
 	case PhaseGameOver:
 		msg["loserId"] = h.loserId
 	}

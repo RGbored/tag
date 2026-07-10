@@ -69,12 +69,14 @@ func (c *Client) readPump() {
 			return
 		}
 		var msg struct {
-			Type  string `json:"type"`
-			Up    bool   `json:"up"`
-			Down  bool   `json:"down"`
-			Left  bool   `json:"left"`
-			Right bool   `json:"right"`
-			Seq   int    `json:"seq"`
+			Type  string  `json:"type"`
+			Up    bool    `json:"up"`
+			Down  bool    `json:"down"`
+			Left  bool    `json:"left"`
+			Right bool    `json:"right"`
+			Seq   int     `json:"seq"`
+			Jump  bool    `json:"jump"`
+			T     float64 `json:"t"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
@@ -84,6 +86,8 @@ func (c *Client) readPump() {
 			c.hub.inputs <- inputMsg{
 				playerID: c.id,
 				seq:      msg.Seq,
+				jump:     msg.Jump,
+				sentAt:   msg.T,
 				input: InputState{
 					Up:    msg.Up,
 					Down:  msg.Down,

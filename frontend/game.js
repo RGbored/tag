@@ -42,10 +42,15 @@
   let loserId = -1;
   let ws = null;
 
-  // Snapshot interpolation — keep last two server snapshots, lerp between them each frame.
-  let prevSnapshot = null;
-  let currSnapshot = null;
+  // Snapshot interpolation — buffer recent server snapshots and render remote players
+  // a few ticks in the past, so bursty delivery (tunnels, Wi-Fi power save) stays smooth.
+  let snapBuf = [];          // { tick, players } ordered by server tick
+  let renderTick = 0;        // fractional server tick remote players are rendered at
+  let lastFrameTs = 0;       // rAF timestamp of previous frame
+  let rtt = -1;              // measured round-trip ms, -1 = unknown
   const TICK_MS = 1000 / 30;
+  const INTERP_DELAY_TICKS = 3;  // ~100ms playback delay for remote players
+  const SNAP_BUF_MAX = 30;       // ~1s of snapshots
 
   // Offscreen canvas baked once on map load; redrawn each frame via drawImage.
   let tileCache = null;
@@ -63,8 +68,11 @@
   let predPrev = null;    // pred at start of current tick, for intra-tick lerp
   let solidGrid = null;   // boolean[row][col] built from tile map
   let lastPredTick = 0;   // rAF timestamp of last physics step
-  let inputSeq = 0;       // monotonic counter; incremented on every input message sent
+  let inputSeq = 0;       // per-tick counter; one input message sent per predicted tick
   let predHistory = [];   // { seq, keys:{up,down,left,right}, wantsJump } — one entry per tick
+  // Visual offset that absorbs reconciliation corrections and decays over ~150ms,
+  // so small (±1 tick) server disagreements never appear as instant jumps.
+  let corrX = 0, corrY = 0;
 
   const keys = { up: false, down: false, left: false, right: false };
   const keyMap = {
@@ -199,6 +207,10 @@
     phase = "lobby";
     taggedId = -1;
     loserId = -1;
+    snapBuf = [];
+    renderTick = 0;
+    rtt = -1;
+    corrX = 0; corrY = 0;
     for (const k of Object.keys(keys)) keys[k] = false;
     gameWrap.style.display = "none";
     homeScreen.style.display = "flex";
@@ -246,9 +258,20 @@
         case "state": {
           const newPhase = msg.phase || "lobby";
           const newPlayers = msg.players || [];
-          prevSnapshot = currSnapshot;
-          currSnapshot = { players: newPlayers, time: performance.now() };
           players = newPlayers;
+
+          const tick = msg.tick ?? 0;
+          const last = snapBuf[snapBuf.length - 1];
+          if (last && last.tick === tick) {
+            last.players = newPlayers; // mid-tick broadcast (join/leave) — replace
+          } else {
+            snapBuf.push({ tick, players: newPlayers });
+            if (snapBuf.length > SNAP_BUF_MAX) snapBuf.shift();
+          }
+
+          if (msg.pings && msg.pings[myId] > 0) {
+            rtt = performance.now() - msg.pings[myId];
+          }
 
           // Initialise prediction when entering playing phase.
           if (newPhase === "playing" && phase !== "playing") {
@@ -259,9 +282,11 @@
               lastPredTick = performance.now();
               predHistory = [];
             }
+            snapBuf = [{ tick, players: newPlayers }];
+            renderTick = tick - INTERP_DELAY_TICKS;
           }
           // Clear prediction when leaving playing phase.
-          if (newPhase !== "playing") { pred = null; predPrev = null; predHistory = []; }
+          if (newPhase !== "playing") { pred = null; predPrev = null; predHistory = []; rtt = -1; corrX = 0; corrY = 0; }
 
           // Rollback reconciliation: when the server acknowledges an input seq, start from
           // the server's authoritative state and re-simulate all inputs the server hasn't
@@ -271,11 +296,13 @@
             if (me) {
               const ackSeq = (msg.seqs && msg.seqs[myId]) || 0;
               if (ackSeq > 0) {
+                const oldX = pred.x, oldY = pred.y;
                 // Find the first history entry that the server hasn't processed yet.
                 const replayStart = predHistory.findIndex(e => e.seq > ackSeq);
                 if (replayStart === -1) {
                   // Server is fully caught up — its state is ground truth.
-                  pred = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: false };
+                  pred = { x: me.x, y: me.y, velY: me.velY ?? 0, onGround: me.onGround ?? false, wantsJump: pred.wantsJump };
+                  predPrev = { ...pred };
                   predHistory = [];
                 } else {
                   // Re-simulate unacknowledged inputs on top of the confirmed server state.
@@ -284,10 +311,16 @@
                     s.wantsJump = predHistory[i].wantsJump;
                     s = stepPred(s, predHistory[i].keys);
                   }
+                  s.wantsJump = pred.wantsJump; // preserve a jump queued since the last tick
                   pred = s;
                   predPrev = { ...pred };
                   predHistory = predHistory.slice(replayStart);
                 }
+                // Fold the correction into the visual offset so the rendered
+                // position stays continuous; it decays to zero in draw().
+                corrX += oldX - pred.x;
+                corrY += oldY - pred.y;
+                if (Math.hypot(corrX, corrY) > 60) { corrX = 0; corrY = 0; } // teleport (e.g. respawn): snap
               }
               // If ackSeq === 0 the server hasn't received our first input yet —
               // pred was seeded from server state on phase entry, so no correction needed.
@@ -376,9 +409,13 @@
   });
 
   // --- Input ---
-  function sendInput() {
+  // Sent once per prediction tick (not per key event) so seq maps 1:1 to ticks —
+  // the server's ack of seq N then means "state includes ticks ≤ N", which is what
+  // rollback reconciliation needs. `jump` is explicit because a quick tap could
+  // otherwise fall entirely between two per-tick sends.
+  function sendInput(seq, jump) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", seq: ++inputSeq, ...keys }));
+    ws.send(JSON.stringify({ type: "input", seq, jump, t: performance.now(), ...keys }));
   }
 
   window.addEventListener("keydown", (e) => {
@@ -390,7 +427,6 @@
       keys[k] = true;
       // Set wantsJump on rising edge of Up — recorded into history and consumed by stepPred.
       if (k === "up" && pred !== null) pred.wantsJump = true;
-      sendInput();
     }
   });
 
@@ -398,10 +434,7 @@
     const k = keyMap[e.key];
     if (!k) return;
     e.preventDefault();
-    if (keys[k]) {
-      keys[k] = false;
-      sendInput();
-    }
+    keys[k] = false;
   });
 
   window.addEventListener("blur", () => {
@@ -409,7 +442,10 @@
     for (const k of Object.keys(keys)) {
       if (keys[k]) { keys[k] = false; changed = true; }
     }
-    if (changed) sendInput();
+    // rAF (and with it the per-tick send) pauses in hidden tabs — push the stop
+    // immediately so the player doesn't run off. Reuses the current seq: no
+    // history entry corresponds to this send.
+    if (changed) sendInput(inputSeq, false);
   });
 
   // --- Render ---
@@ -500,11 +536,38 @@
     if (tileCache) ctx.drawImage(tileCache, 0, 0);
   }
 
+  // Advance the remote-player playback clock by real time, gently steered toward
+  // (latest server tick − delay). Bursty snapshot arrival moves the target in jumps,
+  // but renderTick itself always moves smoothly.
+  function advanceRenderTick(dtMs) {
+    if (snapBuf.length === 0) return;
+    const latestTick = snapBuf[snapBuf.length - 1].tick;
+    const target = latestTick - INTERP_DELAY_TICKS;
+    renderTick += dtMs / TICK_MS;
+    if (Math.abs(renderTick - target) > INTERP_DELAY_TICKS) {
+      renderTick = target; // way off (join, long stall) — resync hard
+    } else {
+      renderTick += (target - renderTick) * 0.05; // drift correction
+    }
+    if (renderTick > latestTick) renderTick = latestTick; // never extrapolate
+  }
+
   function getInterpolatedPlayers() {
-    if (!prevSnapshot || !currSnapshot) return players;
-    const t = Math.min((performance.now() - currSnapshot.time) / TICK_MS, 1);
-    return currSnapshot.players.map(curr => {
-      const prev = prevSnapshot.players.find(p => p.id === curr.id);
+    if (snapBuf.length === 0) return players;
+    // Find the pair of snapshots straddling renderTick (buffer is tick-ordered).
+    let a = snapBuf[0];
+    let b = snapBuf[snapBuf.length - 1];
+    for (let i = snapBuf.length - 1; i >= 0; i--) {
+      if (snapBuf[i].tick <= renderTick) {
+        a = snapBuf[i];
+        b = snapBuf[i + 1] || a;
+        break;
+      }
+    }
+    const span = b.tick - a.tick;
+    const t = span > 0 ? Math.min(Math.max((renderTick - a.tick) / span, 0), 1) : 1;
+    return b.players.map(curr => {
+      const prev = a.players.find(p => p.id === curr.id);
       if (!prev) return curr;
       return { ...curr, x: prev.x + (curr.x - prev.x) * t, y: prev.y + (curr.y - prev.y) * t };
     });
@@ -523,14 +586,34 @@
   }
 
   function draw(ts) {
-    // Advance local prediction at 30 Hz — one step per tick, same rate as server.
-    if (pred !== null && phase === "playing" && ts - lastPredTick >= TICK_MS) {
-      // Record this tick in history (pre-step state) for rollback reconciliation.
-      predHistory.push({ seq: inputSeq, keys: { ...keys }, wantsJump: pred.wantsJump });
-      if (predHistory.length > 120) predHistory.shift(); // keep ~4s
-      predPrev = { ...pred };
-      pred = stepPred(pred, keys);
-      lastPredTick += TICK_MS;
+    const dtMs = lastFrameTs > 0 ? Math.min(ts - lastFrameTs, 250) : 0;
+    lastFrameTs = ts;
+
+    // Advance local prediction at 30 Hz, sending this tick's input with a matching seq.
+    if (pred !== null && phase === "playing") {
+      // After a long stall (hidden tab) don't fast-forward — resync and continue.
+      if (ts - lastPredTick > TICK_MS * 10) lastPredTick = ts - TICK_MS;
+      while (ts - lastPredTick >= TICK_MS) {
+        inputSeq++;
+        sendInput(inputSeq, pred.wantsJump);
+        // Record this tick in history (pre-step state) for rollback reconciliation.
+        predHistory.push({ seq: inputSeq, keys: { ...keys }, wantsJump: pred.wantsJump });
+        if (predHistory.length > 120) predHistory.shift(); // keep ~4s
+        predPrev = { ...pred };
+        pred = stepPred(pred, keys);
+        lastPredTick += TICK_MS;
+      }
+    }
+
+    advanceRenderTick(dtMs);
+
+    // Decay the reconciliation-correction offset (~90% per 60fps frame → gone in ~250ms).
+    if (corrX !== 0 || corrY !== 0) {
+      const decay = Math.pow(0.9, dtMs / 16.7);
+      corrX *= decay;
+      corrY *= decay;
+      if (Math.abs(corrX) < 0.3) corrX = 0;
+      if (Math.abs(corrY) < 0.3) corrY = 0;
     }
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -545,8 +628,8 @@
       const isMe = p.id === myId;
       let rx, ry;
       if (isMe && pred !== null && predPrev !== null) {
-        rx = predPrev.x + (pred.x - predPrev.x) * predT;
-        ry = predPrev.y + (pred.y - predPrev.y) * predT;
+        rx = predPrev.x + (pred.x - predPrev.x) * predT + corrX;
+        ry = predPrev.y + (pred.y - predPrev.y) * predT + corrY;
       } else {
         rx = p.x;
         ry = p.y;
@@ -562,6 +645,14 @@
         drawArrow(rx, ry);
       }
     }
+
+    if (phase === "playing" && rtt >= 0) {
+      ctx.fillStyle = rtt > 200 ? "#e74c3c" : "#7f8c8d";
+      ctx.font = "12px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(Math.round(rtt) + "ms", 6, 14);
+    }
+
     requestAnimationFrame(draw);
   }
 

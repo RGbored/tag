@@ -13,6 +13,14 @@ const (
 	PhaseLobby    = "lobby"
 	PhasePlaying  = "playing"
 	PhaseGameOver = "gameover"
+
+	// Input queue tuning. The server consumes one queued input per player per
+	// tick (one physics step per input seq) to match the client's 1:1 seq→tick
+	// prediction. Network jitter delivers inputs in bursts, so a backlog builds;
+	// MaxInputLag is the depth above which we drain a little faster to catch up,
+	// and MaxQueue is the hard cap that drops the oldest input under a flood.
+	MaxInputLag = 3
+	MaxQueue    = 32
 )
 
 type inputMsg struct {
@@ -49,12 +57,12 @@ type Hub struct {
 	loserId       int
 	timerEnd      time.Time
 	timerDuration time.Duration
-	tagContact    map[int]bool // players currently overlapping with tagger (prevents bounce)
-	lastSeq       map[int]int  // last input seq processed per player (for client-side prediction reconciliation)
-	lastPing      map[int]float64 // latest client timestamp per player, echoed back for RTT display
-	tick          int64        // increments every ticker fire; lets clients order snapshots for interpolation
+	tagContact    map[int]bool       // players currently overlapping with tagger (prevents bounce)
+	inputQueue    map[int][]inputMsg // per-player FIFO of pending inputs, drained one per tick
+	lastSeq       map[int]int        // last input seq processed per player (for client-side prediction reconciliation)
+	lastPing      map[int]float64    // latest client timestamp per player, echoed back for RTT display
+	tick          int64              // increments every ticker fire; lets clients order snapshots for interpolation
 }
-
 
 func (h *Hub) Full() bool {
 	h.mu.Lock()
@@ -173,6 +181,7 @@ func (h *Hub) Run() {
 			if _, ok := h.clients[c.id]; ok {
 				delete(h.clients, c.id)
 				delete(h.players, c.id)
+				delete(h.inputQueue, c.id)
 				close(c.send)
 				log.Printf("player %d left", c.id)
 
@@ -206,21 +215,14 @@ func (h *Hub) Run() {
 
 		case in := <-h.inputs:
 			if h.phase == PhasePlaying {
-				if p, ok := h.players[in.playerID]; ok {
-					// Set WantsJump on rising edge of Up key.
-					if in.input.Up && !p.Input.Up {
-						p.WantsJump = true
+				if _, ok := h.players[in.playerID]; ok {
+					// Buffer the input; it's applied one-per-tick in the tick case
+					// so seq maps 1:1 to physics steps (see reconciliation note).
+					q := append(h.inputQueue[in.playerID], in)
+					if len(q) > MaxQueue {
+						q = q[len(q)-MaxQueue:] // flood: drop oldest
 					}
-					if in.jump {
-						p.WantsJump = true
-					}
-					p.Input = in.input
-					if in.seq > 0 {
-						h.lastSeq[in.playerID] = in.seq
-					}
-					if in.sentAt > 0 {
-						h.lastPing[in.playerID] = in.sentAt
-					}
+					h.inputQueue[in.playerID] = q
 				}
 			}
 
@@ -235,6 +237,7 @@ func (h *Hub) Run() {
 				h.taggedID = h.randomPlayer()
 				h.loserId = -1
 				h.tagContact = make(map[int]bool)
+				h.inputQueue = make(map[int][]inputMsg)
 				h.lastSeq = make(map[int]int)
 				h.lastPing = make(map[int]float64)
 				h.resetPlayersToSpawn()
@@ -257,9 +260,43 @@ func (h *Hub) Run() {
 		case <-ticker.C:
 			h.tick++
 			if h.phase == PhasePlaying {
-				// Physics.
-				for _, p := range h.players {
-					p.Step(h.gameMap)
+				// Apply queued inputs and run physics. Consume one input per
+				// player per tick so each acked seq corresponds to exactly one
+				// physics step (the invariant client reconciliation relies on).
+				// Drain 2/tick when a backlog has built from jitter so latency
+				// doesn't accumulate. When starved, hold the last input and still
+				// step so gravity keeps applying — and don't advance lastSeq, so
+				// the client keeps replaying its unacked ticks.
+				for id, p := range h.players {
+					q := h.inputQueue[id]
+					steps := 1
+					if len(q) > MaxInputLag {
+						steps = 2
+					}
+					consumed := 0
+					for ; consumed < steps && len(q) > 0; consumed++ {
+						in := q[0]
+						q = q[1:]
+						// Rising edge of Up relative to the previously applied input.
+						if in.input.Up && !p.Input.Up {
+							p.WantsJump = true
+						}
+						if in.jump {
+							p.WantsJump = true
+						}
+						p.Input = in.input
+						if in.seq > 0 {
+							h.lastSeq[id] = in.seq
+						}
+						if in.sentAt > 0 {
+							h.lastPing[id] = in.sentAt
+						}
+						p.Step(h.gameMap)
+					}
+					if consumed == 0 {
+						p.Step(h.gameMap) // input starved — hold last input
+					}
+					h.inputQueue[id] = q
 				}
 
 				// Tag collision — only transfer on first contact (not while overlapping).
@@ -344,9 +381,27 @@ func (h *Hub) broadcastState() {
 		return
 	}
 	for _, c := range h.clients {
-		select {
-		case c.send <- data:
-		default:
-		}
+		queueState(c, data)
+	}
+}
+
+// queueState pushes the newest snapshot to a client, dropping the oldest buffered
+// message if the buffer is full. state is a full snapshot, so a client on a slow
+// downlink should always receive the freshest frame rather than draining a
+// multi-second backlog of stale ones (which inflates apparent RTT and lag).
+func queueState(c *Client, data []byte) {
+	select {
+	case c.send <- data:
+		return
+	default:
+	}
+	// Buffer full: evict the oldest queued message, then enqueue the newest.
+	select {
+	case <-c.send:
+	default:
+	}
+	select {
+	case c.send <- data:
+	default:
 	}
 }

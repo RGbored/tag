@@ -13,7 +13,7 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 1024
-	sendBufferSize = 64
+	sendBufferSize = 8 // ~260ms at 30Hz; broadcast drops oldest when full (latest-snapshot delivery)
 )
 
 // Client is a single WebSocket connection.

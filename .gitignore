@@ -4,3 +4,7 @@ logs/
 tag-server
 server/tag-server
 server/server
+
+# Maps are runtime data — the in-game editor writes to maps/*.json, so tracking
+# them makes the working tree dirty on any deployed instance. Kept on disk, ignored by git.
+maps/

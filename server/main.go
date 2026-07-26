@@ -11,12 +11,44 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// version is the git commit the binary was built from. Go stamps this into the
+// build info automatically when `go build` runs inside the repo (no ldflags or
+// version file needed); it's "dev" under `go run` and "unknown" if unavailable.
+var version = buildVersion()
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	rev, modified := "", false
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "dev"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if modified {
+		rev += "-dirty"
+	}
+	return rev
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -75,10 +107,10 @@ func main() {
 		handleMapSave(w, r)
 	})
 
-	// Health check.
+	// Health check (includes the git commit the binary was built from).
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": version})
 	})
 
 	mux.Handle("/", http.FileServer(http.Dir("../frontend")))
